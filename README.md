@@ -7,7 +7,7 @@ The R script was test on R version 4.4.1.
   - gridExtra 2.3
   - glue 1.8.0
 
-If you want to be able to Canny edge detection,
+If you want to be able to use Canny edge detection,
 1) install the canny edge detection plugin into FIJI: https://imagej.net/ij/plugins/canny/index.html
 2) Download the LamelliQuant_FIJI_Canny_Enabled.ijm version of the ImageJ Macro
 
