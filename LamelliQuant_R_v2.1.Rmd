@@ -1,0 +1,308 @@
+---
+title: "Lamellipodia Protrusion Analysis (Leading‑Edge Mask Input)"
+author: "Ian Eder (mod. by ChatGPT)"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    
+    This script analyzes leading-edge dynamics from kymograph edge traces. It expects at least one .csv file, each with two columns: X (frame) and Y (edge position). 
+    
+    For each file, the script:
+      - Extracts the frontmost edge position per frame
+      - Smooths the trace using LOESS
+      - Detects peaks and identifies protrusion spans bounded by inflections or troughs
+      - Measures protrusion/retraction velocity and height
+      -Outputs two files:
+        1. protrusion_metrics.csv - one row per valid protrusion
+        2. protrusion_metrics_summar.csv - summary stats per kymograph
+        
+    Instructions:
+      - Place all input CSVs in the working directory
+      - Program will overwrite previous output files unless renamed
+      - Adjust parameters as needed
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = TRUE,
+  warning   = FALSE,
+  fig.width = 6,
+  fig.height= 4
+)
+```
+
+# Packages
+```{r packages}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(zoo)
+  library(gridExtra)
+  library(glue)
+})
+```
+
+# User Parameters (TWEAK AS NEEDED)
+```{r parameters}
+w            <- 5      # half‑window for local extrema search
+span         <- 0.07   # LOESS smoothing span
+slope_thresh <- 0.3  # min Δ‑slope for inflection
+min_height   <- 0.5    # min peak height (px)
+min_sep      <- w      # min frames separating accepted peaks
+preview_n    <- 5      # QC plots to render
+show_deriv   <- TRUE   # show slope panel?
+invert       <- TRUE   # ImageJ y‑axis → conventional
+```
+
+# Smoothing & landmark detection functions
+```{r helpers}
+loess_smooth <- function(x, y, span){
+  loess(y ~ x, span = span, surface = "direct")$fitted
+}
+
+find_inflect <- function(y_sm, thr){
+  s <- diff(y_sm)
+  # slope crosses from negative to positive AND the diffrence ≥ threshold
+  which((s[-1] > 0) & ((s[-1] - s[-length(s)]) > thr)) + 1
+  # (s[-length(s)] <= 0) &
+}
+
+find_peaks <- function(y_sm, w){
+  y_max <- rollapply(zoo(y_sm), 2*w + 1, max, align = "center") #uses rolling window to seek local maxima
+  core  <- (w + 1):(length(y_sm) - w) #defines the center indices of windows
+  which(y_max - y_sm[core] <= 0) + w #finds indices where center = window max (these are peaks)
+}
+
+find_troughs <- function(y_sm, w) find_peaks(-y_sm, w) #uses same logic for peaks, but on inverted plot
+```
+
+# Core analysis
+```{r core}
+
+
+analyze_trace <- function(edge_df, w, span, thr, min_h){
+  x <- edge_df$x
+  y <- edge_df$y - edge_df$y[1]
+  # ensure full integer frame sequence, fill missing x positions
+  x_full <- seq(0, max(x))  # all expected frames
+  y_full <- rep(NA_real_, length(x_full))
+  y_full[match(x, x_full)] <- y
+  # fill missing frames by linear interpolation or constant carry
+  y_full <- zoo::na.approx(y_full, x = x_full, rule = 2)
+  x_full <- x_full - min(x_full)
+
+  x <- x_full
+  y <- y_full - y_full[1]
+  if(invert) y <- -y        
+
+  
+  y_sm  <- loess_smooth(x, y, span)
+
+  pk_raw <- sort(find_peaks(y_sm, w))     # all candidate peaks (unverified yet)
+  infl   <- sort(find_inflect(y_sm, thr)) # upward inflections
+  tr     <- sort(find_troughs(y_sm, w))   # troughs (local minima)
+
+  # add boundary landmarks so spans can start/end at edges
+  boundary_pts <- c(1, length(y_sm)) #define first and last index of trace
+  infl <- sort(unique(c(infl, boundary_pts))) #add these boundary indices to list of inflection points
+  tr   <- sort(unique(c(tr,   boundary_pts))) #add these boundary indices to list of trough points
+
+  # De‑clutter peaks (KEEP LOWER PEAK when too close)
+  
+  #if no candidate peaks, return empty metrics table
+  if(!length(pk_raw))
+    return(list(metrics = tibble(),
+                qc = list(x = x, y = y, y_sm = y_sm,
+                           pk = pk_raw, infl = infl, tr = tr)))
+
+  
+  pk_height <- y_sm[pk_raw] #get height for each candidate peak
+  keep_flag <- logical(length(pk_raw)) #creates a logical vector to flag which peaks to keep (all are initially FALSE)
+  # iterate from SHORTEST to tallest, so lower peak wins if within min_sep
+  for(j in order(pk_height, decreasing = FALSE)){
+    if(any(abs(pk_raw[j] - pk_raw[keep_flag]) < min_sep)) next # skip current peak if it's too close to one we've already kept
+    keep_flag[j] <- TRUE #otherwise, keep this peak 
+  }
+  pk <- pk_raw[keep_flag] #finalize de-cluttered list of verified peaks
+
+  #same as before, if no peaks are in list of verified peaks, return empty metrics
+  if(!length(pk))
+    return(list(metrics = tibble(),
+                qc = list(x = x, y = y, y_sm = y_sm,
+                           pk = pk_raw, infl = infl, tr = tr)))
+
+  
+  starts <- ends <- integer(); peaks_keep <- integer() #initialize empty vectors to store indices of starts, ends, peaks
+  start_src <- end_src <- character() #initialize empty vector to store qualitative info on start and ends (whether it is a trough or inflection)
+
+  for(i in seq_along(pk)){
+    p       <- pk[i]
+    prev_pk <- if(i == 1) -Inf else pk[i-1] #sets indices for previous peak. is set to infinity if we are at the first peak so that program doesn't crash
+    next_pk <- if(i == length(pk)) Inf else pk[i+1] #sets indices for next peak. Is set to infinity if we are at the last peak so that program doesn't crash
+
+    # Left window (prev_pk , p)
+    cand_left <- c(infl[infl > prev_pk & infl < p],
+                   tr  [tr   > prev_pk & tr   < p]) #concatenates all troughs and inflections from previous peak to current peak
+    if(!length(cand_left)) next   # if no landmark, then skip peak
+    l <- max(cand_left)#left landmark is the closest one to current peak
+    src_l <- if(l %in% infl) "inflection" else "trough"  #if the left landmark is in the list of inflections, it labels it as an inflection
+
+    # Right window (p , next_pk)
+    cand_right <- c(infl[infl > p & infl < next_pk],
+                    tr  [tr   > p & tr   < next_pk]) #concatenate all troughs and inflections from current peak to next peak
+    if(!length(cand_right)) next  # if no landmark, then discard peak
+    r <- min(cand_right) #right landmark set to closest landmark
+    src_r <- if(r %in% infl) "inflection" else "trough" #if the landmark is in list of inflections, it is labeled as an inflection
+
+    # Validation
+    if(r <= l)                      next #if right landmark is less than left landmark, skips peak
+    if((y_sm[p] - y_sm[l]) < min_h) next #if the height of protrusion is less than minimum height parameter, skips peak
+
+    # puts all values in lists
+    peaks_keep <- c(peaks_keep, p)
+    starts     <- c(starts, l)
+    ends       <- c(ends,   r)
+    start_src  <- c(start_src, src_l)
+    end_src    <- c(end_src,   src_r)
+  }
+
+  #if nothing in list of verified peaks, then it returns an empty metrics table
+  if(!length(peaks_keep))
+    return(list(metrics = tibble(),
+                qc = list(x = x, y = y, y_sm = y_sm,
+                           pk = pk_raw, infl = infl, tr = tr)))
+
+  # ---- Metrics ----
+  prot_width   <- peaks_keep - starts
+  prot_height  <- y_sm[peaks_keep] - y_sm[starts]
+  retr_width   <- ends - peaks_keep
+  retr_height  <- y_sm[peaks_keep] - y_sm[ends]
+  net_dist  <- prot_height - retr_height
+
+  prot_vel <- ifelse(prot_width  > 0, prot_height / prot_width,  NA_real_) #calculates protrusion velocity
+  retr_vel <- ifelse(retr_width  > 0, retr_height / retr_width, NA_real_) #calculates retraction velocity
+
+  metrics <- tibble(
+    start        = starts,
+    peak         = peaks_keep,
+    end          = ends,
+    prot_width   = prot_width,
+    prot_height  = prot_height,
+    prot_vel     = prot_vel,
+    retr_width   = retr_width,
+    retr_height  = retr_height,
+    retr_vel     = retr_vel,
+    net_dist = net_dist,
+    start_src    = start_src,
+    end_src      = end_src
+  )
+
+  list(metrics = metrics,
+     qc = list(x = x, y = y, y_sm = y_sm,
+               pk = pk, infl = infl, tr = tr,
+               n = length(x)))
+}
+```
+
+# Run analysis & QC
+```{r run}
+files <- list.files(pattern = "*.csv", full.names = TRUE) %>%
+           discard(~ basename(.x) %in% c("protrusion_metrics.csv", "protrusion_metrics_summary.csv"))
+
+results <- tibble(); shown <- 0
+frames_map <- list()   # store total frame count per file
+
+for(f in files){
+  dat <- read_csv(f, show_col_types = FALSE)
+  if(!all(c("X","Y") %in% names(dat))) stop(glue("{f} missing X/Y"))
+
+  edge <- dat %>%
+    group_by(X) %>%
+    summarise(y = min(Y, na.rm = TRUE), .groups = "drop") %>%
+    rename(x = X)
+
+  frames_map[[basename(f)]] <- nrow(edge)
+
+  out <- analyze_trace(edge, w, span, slope_thresh, min_height)
+  if(nrow(out$metrics)) results <- bind_rows(results, out$metrics %>% mutate(file = basename(f)))
+
+  # QC plotting (first preview_n files)
+  if(shown < preview_n){
+    shown <- shown + 1
+
+    #prepares lists to store values that will be plotted
+    base_df <- tibble(frame = out$qc$x, raw = out$qc$y, smooth = out$qc$y_sm)
+    infl_df <- tibble(frame = out$qc$infl, y = out$qc$y_sm[out$qc$infl])
+    tr_df   <- tibble(frame = out$qc$tr,   y = out$qc$y_sm[out$qc$tr])
+    pk_df   <- tibble(frame = out$metrics$peak, y = out$qc$y_sm[out$metrics$peak])
+    start_df <- tibble(frame = out$metrics$start, y=out$qc$y_sm[out$metrics$start])
+    end_df <- tibble(frame = out$metrics$end,y = out$qc$y_sm[out$metrics$end])
+
+   
+
+   # displays plot with peaks in magenta and start/end points in cyan
+    p_signal <- ggplot(base_df, aes(frame, raw)) +
+      geom_point(color = "grey60", size = 0.6) + #raw points as small grey circles
+      geom_line(aes(y = smooth), linewidth = 1.2) + #overlays smoothed LOESS curve
+      # Peaks in magenta
+      geom_point(data = pk_df, aes(y = y), color = "magenta", fill = "magenta", shape = 21, size = 2) +
+      
+      # Starts + ends in cyan
+      geom_point(data = start_df, aes(y = y), color = "cyan", fill = "cyan", shape = 21, size = 2) +
+      geom_point(data = end_df,   aes(y = y), color = "cyan", fill = "cyan", shape = 21, size = 2) +
+      
+      #if you wish to see all inflection/troughs, uncomment two lines below and comment two lines above (and vice versa)
+      #geom_point(data = infl_df, aes(y = y), color = "cyan", fill = "cyan", shape = 21, size = 2) +
+      #geom_point(data = tr_df,   aes(y = y), color = "cyan", fill = "cyan", shape = 21, size = 2) +
+      
+      labs(title = basename(f), x = "Frame", y = "Edge position (px)") +
+      theme_classic() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+    #if show derivative = TRUE, displays slope graph
+    if(show_deriv){
+      slope_df <- tibble(frame = out$qc$x[-1], slope = diff(out$qc$y_sm))
+      p_slope  <- ggplot(slope_df, aes(frame, slope)) +
+        geom_line(linewidth = 1.1) +
+        geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+        labs(title = "Slope", x = "Frame", y = "Δ(px)") +
+        theme_classic() +
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+      grid.arrange(p_signal, p_slope, ncol = 1)
+    } else {
+      print(p_signal)
+    }
+  }
+}
+
+# outputs metrics in csv file
+write_csv(results, "protrusion_metrics.csv")
+
+# summarizes per image statistics
+summary_df <- results %>%
+  group_by(file) %>%
+  summarise(
+    total_prot       = n(),
+    total_frames     = frames_map[[unique(file)]],
+    frequency        = total_prot / total_frames,
+    avg_prot_vel     = mean(prot_vel,  na.rm = TRUE),
+    avg_prot_height  = mean(prot_height, na.rm = TRUE),
+    avg_retr_height  = mean(retr_height, na.rm = TRUE),
+    avg_net_dist     = mean(net_dist, na.rm = TRUE),
+    avg_retr_vel     = mean(retr_vel,  na.rm = TRUE),
+    .groups = "drop")
+
+#outputs to summar csv file
+write_csv(summary_df, "protrusion_metrics_summary.csv")
+
+#displays message of ____ protrusions written message to user
+cat(glue(
+  "\u2714 {nrow(results)} protrusion(s) written plus summary for ",
+  "{nrow(summary_df)} kymograph(s). {shown} QC plot(s) shown.\n"
+))
+```
+
+
